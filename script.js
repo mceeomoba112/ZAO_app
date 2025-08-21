@@ -4,17 +4,44 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 
 // Initialize Supabase client with error handling
 let supabase;
-try {
-    if (typeof window !== 'undefined' && window.supabase) {
-        supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-        console.log('Supabase client initialized successfully');
-    } else {
-        throw new Error('Supabase library not loaded');
+let initializationAttempts = 0;
+const maxInitAttempts = 3;
+
+function initializeSupabase() {
+    try {
+        if (typeof window !== 'undefined' && window.supabase) {
+            supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+                auth: {
+                    persistSession: true,
+                    autoRefreshToken: true,
+                    detectSessionInUrl: true
+                }
+            });
+            console.log('Supabase client initialized successfully');
+            return true;
+        } else {
+            throw new Error('Supabase library not loaded');
+        }
+    } catch (error) {
+        console.error('Failed to initialize Supabase client:', error);
+        initializationAttempts++;
+        
+        if (initializationAttempts < maxInitAttempts) {
+            console.log(`Retrying initialization... Attempt ${initializationAttempts + 1}`);
+            setTimeout(() => {
+                if (!supabase) {
+                    initializeSupabase();
+                }
+            }, 1000);
+        } else {
+            showError('Failed to initialize authentication system. Please refresh the page.');
+        }
+        return false;
     }
-} catch (error) {
-    console.error('Failed to initialize Supabase client:', error);
-    showError('Failed to initialize authentication system. Please refresh the page.');
 }
+
+// Initialize on load
+initializeSupabase();
 
 let currentUser = null;
 let currentUserProfile = null;
@@ -29,7 +56,10 @@ let lastActivity = Date.now();
 async function testSupabaseConnection() {
     try {
         if (!supabase) {
-            throw new Error('Supabase client not initialized');
+            // Try to initialize first
+            if (!initializeSupabase()) {
+                throw new Error('Supabase client not initialized');
+            }
         }
 
         // Test connection by trying to get session
@@ -37,6 +67,16 @@ async function testSupabaseConnection() {
         
         if (error && !error.message.includes('No active session')) {
             throw error;
+        }
+
+        // Test database connection
+        const { data: testQuery, error: testError } = await supabase
+            .from('user_profiles')
+            .select('user_id')
+            .limit(1);
+
+        if (testError && !testError.message.includes('permission denied')) {
+            console.warn('Database test failed:', testError);
         }
 
         console.log('Supabase connection test successful');
@@ -839,12 +879,21 @@ async function handleRegister(event) {
     }
 
     if (!supabase) {
-        showError('Authentication system not available. Please refresh the page.');
-        return;
+        // Try to reinitialize
+        if (!initializeSupabase()) {
+            showError('Authentication system not available. Please refresh the page.');
+            return;
+        }
     }
 
     try {
         showError('Creating account...', 'success');
+
+        // Test connection first
+        const { data: testData, error: testError } = await supabase.auth.getSession();
+        if (testError && !testError.message.includes('No active session')) {
+            throw new Error('Connection failed: ' + testError.message);
+        }
 
         // Sign up with Supabase Auth
         const { data, error } = await supabase.auth.signUp({
@@ -864,6 +913,8 @@ async function handleRegister(event) {
                 showError('An account with this email already exists. Please try logging in instead.');
             } else if (error.message.includes('Invalid email')) {
                 showError('Please enter a valid email address.');
+            } else if (error.message.includes('Signup is disabled')) {
+                showError('Account registration is currently disabled. Please contact support.');
             } else {
                 showError('Registration failed: ' + error.message);
             }
@@ -871,51 +922,36 @@ async function handleRegister(event) {
         }
 
         if (data.user) {
-            // Wait a moment for auth to complete
-            await new Promise(resolve => setTimeout(resolve, 1000));
+            currentUser = data.user;
+            showError('Account created successfully! You can now use the app.', 'success');
+            
+            // Wait for auth to settle
+            await new Promise(resolve => setTimeout(resolve, 1500));
 
-            // Create user profile with auto-generated username
-            const { error: profileError } = await supabase
-                .from('user_profiles')
-                .insert([
-                    {
-                        user_id: data.user.id,
-                        full_name: fullName,
-                        email: email,
-                        phone_number: phone,
-                        username: '' // Will be auto-generated by trigger
-                    }
-                ]);
+            try {
+                // Create user profile
+                await createUserProfile();
+                
+                // Load interface
+                await loadUserProfile();
+                showChatInterface();
+                await loadFriends();
+                await loadGroups();
+                await loadFriendRequests();
+                subscribeToMessages();
 
-            if (profileError) throw profileError;
-
-            // Create default user settings with notifications enabled
-            const { error: settingsError } = await supabase
-                .from('user_settings')
-                .insert([
-                    {
-                        user_id: data.user.id,
-                        theme: 'dark',
-                        notifications_enabled: true,
-                        sound_enabled: true,
-                        profile_visibility: 'public'
-                    }
-                ]);
-
-            if (settingsError) throw settingsError;
-
-            // Ensure username is assigned immediately for new accounts
-            await ensureUserHasUsername();
-
-            // Automatically request notification permissions for new users
-            setTimeout(() => {
-                requestNotificationPermission();
-            }, 2000);
-
-            showError('Registration successful! Please check your email to verify your account.', 'success');
+                // Request notifications after successful registration
+                setTimeout(() => {
+                    requestNotificationPermission();
+                }, 2000);
+            } catch (setupError) {
+                console.error('Error setting up user profile:', setupError);
+                showError('Account created but there was an issue setting up your profile. Please try logging in.', 'error');
+            }
         }
     } catch (error) {
-        showError(error.message);
+        console.error('Registration error:', error);
+        showError('Registration failed: ' + error.message);
     }
 }
 
@@ -938,12 +974,21 @@ async function handleLogin(event) {
     }
 
     if (!supabase) {
-        showError('Authentication system not available. Please refresh the page.');
-        return;
+        // Try to reinitialize
+        if (!initializeSupabase()) {
+            showError('Authentication system not available. Please refresh the page.');
+            return;
+        }
     }
 
     try {
         showError('Signing in...', 'success');
+
+        // Test connection first
+        const { data: testData, error: testError } = await supabase.auth.getSession();
+        if (testError && !testError.message.includes('No active session')) {
+            throw new Error('Connection failed: ' + testError.message);
+        }
 
         const { data, error } = await supabase.auth.signInWithPassword({
             email: email,
@@ -956,21 +1001,35 @@ async function handleLogin(event) {
                 showError('Invalid email or password. Please check your credentials and try again.');
             } else if (error.message.includes('Email not confirmed')) {
                 showError('Please check your email and click the confirmation link before signing in.');
+            } else if (error.message.includes('Too many requests')) {
+                showError('Too many login attempts. Please wait a moment and try again.');
             } else {
                 showError('Login failed: ' + error.message);
             }
             return;
         }
 
-        currentUser = data.user;
-        await loadUserProfile();
-        showChatInterface();
-        await loadFriends();
-        await loadGroups();
-        await loadFriendRequests();
-        subscribeToMessages();
+        if (data.user) {
+            currentUser = data.user;
+            showError('Login successful!', 'success');
+            
+            try {
+                await loadUserProfile();
+                showChatInterface();
+                await Promise.allSettled([
+                    loadFriends(),
+                    loadGroups(),
+                    loadFriendRequests()
+                ]);
+                subscribeToMessages();
+            } catch (setupError) {
+                console.error('Error loading user data:', setupError);
+                showError('Login successful but there was an issue loading your data. Please try refreshing the page.', 'error');
+            }
+        }
     } catch (error) {
-        showError(error.message);
+        console.error('Login error:', error);
+        showError('Login failed: ' + error.message);
     }
 }
 
@@ -2297,6 +2356,71 @@ async function saveSettings() {
         closeModal('settings-modal');
     } catch (error) {
         showError('Error saving settings: ' + error.message);
+    }
+}
+
+// Send friend request
+async function sendFriendRequest() {
+    const username = document.getElementById('friend-username').value.trim();
+
+    if (!username) {
+        showError('Please enter a username');
+        return;
+    }
+
+    try {
+        // Find user by username
+        const { data: targetUser, error: userError } = await supabase
+            .from('user_profiles')
+            .select('user_id, username, full_name')
+            .eq('username', username)
+            .single();
+
+        if (userError || !targetUser) {
+            showError('User not found');
+            return;
+        }
+
+        if (targetUser.user_id === currentUser.id) {
+            showError('You cannot send a friend request to yourself');
+            return;
+        }
+
+        // Check if friendship already exists
+        const { data: existingFriendship } = await supabase
+            .from('friendships')
+            .select('*')
+            .or(`and(requester_id.eq.${currentUser.id},addressee_id.eq.${targetUser.user_id}),and(requester_id.eq.${targetUser.user_id},addressee_id.eq.${currentUser.id})`)
+            .single();
+
+        if (existingFriendship) {
+            if (existingFriendship.status === 'accepted') {
+                showError('You are already friends with this user');
+            } else if (existingFriendship.status === 'pending') {
+                showError('Friend request already sent');
+            }
+            return;
+        }
+
+        // Send friend request
+        const { error: requestError } = await supabase
+            .from('friendships')
+            .insert([
+                {
+                    requester_id: currentUser.id,
+                    addressee_id: targetUser.user_id,
+                    status: 'pending'
+                }
+            ]);
+
+        if (requestError) throw requestError;
+
+        showError(`Friend request sent to ${targetUser.full_name}!`, 'success');
+        document.getElementById('friend-username').value = '';
+        closeModal('add-friend-modal');
+
+    } catch (error) {
+        showError('Error sending friend request: ' + error.message);
     }
 }
 
