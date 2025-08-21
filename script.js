@@ -365,22 +365,34 @@ function playNotificationSound() {
     }
 }
 
-// Setup activity tracking
+// Setup activity tracking with more frequent updates
 function setupActivityTracking() {
-    // Update last activity every 30 seconds when user is active
+    // Update last activity every 10 seconds when user is active
     setInterval(() => {
         if (currentUser && document.visibilityState === 'visible') {
             lastActivity = Date.now();
             updateUserStatus(true);
         }
-    }, 30000);
+    }, 10000);
 
-    // Check for inactive users and update status
+    // Check for inactive users and update status every 30 seconds
     setInterval(() => {
-        if (currentUser && Date.now() - lastActivity > 300000) { // 5 minutes
+        if (currentUser && Date.now() - lastActivity > 120000) { // 2 minutes
             updateUserStatus(false);
         }
-    }, 60000);
+    }, 30000);
+
+    // Track user activity events
+    ['mousedown', 'mousemove', 'keypress', 'scroll', 'touchstart', 'click'].forEach(event => {
+        document.addEventListener(event, () => {
+            if (currentUser) {
+                lastActivity = Date.now();
+                if (document.visibilityState === 'visible') {
+                    updateUserStatus(true);
+                }
+            }
+        }, { passive: true });
+    });
 }
 
 // Update user online status
@@ -853,22 +865,44 @@ async function handleLogin(event) {
     }
 }
 
-// Handle logout
+// Handle logout with proper cleanup
 async function handleLogout() {
     try {
+        // Update user status to offline before logout
+        if (currentUser) {
+            await updateUserStatus(false);
+        }
+
+        // Cleanup subscriptions and intervals
         if (messagesSubscription) {
             messagesSubscription.unsubscribe();
+            messagesSubscription = null;
+        }
+
+        if (window.messageRefreshInterval) {
+            clearInterval(window.messageRefreshInterval);
+            window.messageRefreshInterval = null;
         }
 
         const { error } = await supabase.auth.signOut();
         if (error) throw error;
 
+        // Reset all global variables
         currentUser = null;
         currentUserProfile = null;
         activeChat = null;
+        activeChatType = null;
+
+        // Clear UI
         showAuthInterface();
         document.getElementById('chat-messages').innerHTML = '';
+        document.getElementById('user-list').innerHTML = '';
+        document.getElementById('friends-list').innerHTML = '';
+        document.getElementById('friend-requests-list').innerHTML = '';
+
+        console.log('User logged out successfully');
     } catch (error) {
+        console.error('Error during logout:', error);
         showError(error.message);
     }
 }
@@ -1008,10 +1042,11 @@ async function loadFriendRequests() {
     }
 }
 
-// Create user element
+// Create user element with online indicators
 function createUserElement(user, type) {
     const element = document.createElement('div');
     element.className = 'user-item';
+    element.dataset.userId = user.user_id;
     element.onclick = () => {
         if (type === 'chat') {
             openChat(user);
@@ -1022,15 +1057,94 @@ function createUserElement(user, type) {
         ? `<img src="${user.avatar_url}" class="user-avatar" alt="${user.full_name}">` 
         : `<div class="user-avatar">${user.full_name.charAt(0).toUpperCase()}</div>`;
 
+    const onlineIndicator = `<div class="online-indicator" id="online-${user.user_id}"></div>`;
+
     element.innerHTML = `
-        ${avatar}
+        <div class="user-avatar-container">
+            ${avatar}
+            ${onlineIndicator}
+        </div>
         <div class="user-details">
             <div class="user-name">${user.full_name}</div>
             <div class="user-username">@${user.username}</div>
+            <div class="user-status" id="status-${user.user_id}">Offline</div>
         </div>
     `;
 
+    // Check and set initial online status
+    checkUserOnlineStatus(user.user_id, element);
+
     return element;
+}
+
+// Check user online status
+async function checkUserOnlineStatus(userId, element) {
+    try {
+        const { data } = await supabase
+            .from('user_profiles')
+            .select('is_online, last_seen')
+            .eq('user_id', userId)
+            .single();
+
+        if (data) {
+            updateUserOnlineIndicator(element, data.is_online, data.last_seen);
+        }
+    } catch (error) {
+        console.error('Error checking online status:', error);
+    }
+}
+
+// Update user online indicator
+function updateUserOnlineIndicator(element, isOnline, lastSeen) {
+    const indicator = element.querySelector('.online-indicator');
+    const status = element.querySelector('.user-status');
+    
+    if (indicator) {
+        if (isOnline) {
+            indicator.className = 'online-indicator online';
+            indicator.title = 'Online';
+        } else {
+            indicator.className = 'online-indicator offline';
+            const lastSeenTime = new Date(lastSeen);
+            const now = new Date();
+            const diffMinutes = Math.floor((now - lastSeenTime) / (1000 * 60));
+            
+            if (diffMinutes < 5) {
+                indicator.title = 'Just now';
+            } else if (diffMinutes < 60) {
+                indicator.title = `${diffMinutes} minutes ago`;
+            } else {
+                const diffHours = Math.floor(diffMinutes / 60);
+                indicator.title = `${diffHours} hours ago`;
+            }
+        }
+    }
+    
+    if (status) {
+        if (isOnline) {
+            status.textContent = 'Online';
+            status.style.color = '#22c55e';
+        } else {
+            const lastSeenTime = new Date(lastSeen);
+            const now = new Date();
+            const diffMinutes = Math.floor((now - lastSeenTime) / (1000 * 60));
+            
+            if (diffMinutes < 5) {
+                status.textContent = 'Just now';
+            } else if (diffMinutes < 60) {
+                status.textContent = `${diffMinutes}m ago`;
+            } else {
+                const diffHours = Math.floor(diffMinutes / 60);
+                if (diffHours < 24) {
+                    status.textContent = `${diffHours}h ago`;
+                } else {
+                    const diffDays = Math.floor(diffHours / 24);
+                    status.textContent = `${diffDays}d ago`;
+                }
+            }
+            status.style.color = 'rgba(255,255,255,0.6)';
+        }
+    }
 }
 
 // Group functionality removed
@@ -1183,62 +1297,210 @@ async function loadMessages() {
 
 // Subscribe to real-time messages
 function subscribeToMessages() {
+    // Unsubscribe from existing subscription if any
+    if (messagesSubscription) {
+        messagesSubscription.unsubscribe();
+    }
+
+    // Subscribe to messages channel with better error handling
     messagesSubscription = supabase
-        .channel('messages')
+        .channel('public:messages', {
+            config: {
+                broadcast: { self: true },
+                presence: { key: currentUser.id }
+            }
+        })
         .on(
             'postgres_changes',
             {
                 event: 'INSERT',
                 schema: 'public',
-                table: 'messages'
+                table: 'messages',
+                filter: `recipient_id=eq.${currentUser.id}`
             },
             async (payload) => {
-                // Get user profile for the new message
-                const { data: userProfile } = await supabase
-                    .from('user_profiles')
-                    .select('full_name, username')
-                    .eq('user_id', payload.new.user_id)
-                    .single();
-
-                const messageWithProfile = {
-                    ...payload.new,
-                    user_profiles: userProfile
-                };
-
-                // Show notification if message is not from current user and app is not focused
-                if (payload.new.user_id !== currentUser.id && 
-                    (document.visibilityState === 'hidden' || !shouldDisplayMessage(messageWithProfile))) {
-
-                    const senderName = userProfile ? userProfile.full_name : 'Someone';
-                    let notificationBody = '';
-
-                    if (payload.new.message_type === 'text') {
-                        notificationBody = payload.new.content;
-                    } else if (payload.new.message_type === 'image') {
-                        notificationBody = `${senderName} sent you an image`;
-                    } else if (payload.new.message_type === 'video') {
-                        notificationBody = `${senderName} sent you a video`;
-                    }
-
-                    showLocalNotification(
-                        `New message from ${senderName}`,
-                        notificationBody,
-                        {
-                            type: 'message',
-                            sender_id: payload.new.user_id,
-                            message_id: payload.new.id
-                        }
-                    );
-                }
-
-                // Only display if it's for the active chat
-                if (shouldDisplayMessage(messageWithProfile)) {
-                    displayMessage(messageWithProfile);
-                    scrollToBottom();
-                }
+                console.log('Received message:', payload);
+                await handleNewMessage(payload);
             }
         )
-        .subscribe();
+        .on(
+            'postgres_changes',
+            {
+                event: 'INSERT',
+                schema: 'public',
+                table: 'messages',
+                filter: `user_id=eq.${currentUser.id}`
+            },
+            async (payload) => {
+                console.log('Sent message confirmed:', payload);
+                await handleNewMessage(payload);
+            }
+        )
+        .on('presence', { event: 'sync' }, () => {
+            updateOnlineUsers();
+        })
+        .on('presence', { event: 'join' }, ({ key, newPresences }) => {
+            console.log('User joined:', key, newPresences);
+            updateOnlineUsers();
+        })
+        .on('presence', { event: 'leave' }, ({ key, leftPresences }) => {
+            console.log('User left:', key, leftPresences);
+            updateOnlineUsers();
+        })
+        .subscribe(async (status) => {
+            console.log('Subscription status:', status);
+            if (status === 'SUBSCRIBED') {
+                console.log('Successfully subscribed to real-time updates');
+                // Update user presence
+                await messagesSubscription.track({
+                    user_id: currentUser.id,
+                    online_at: new Date().toISOString(),
+                });
+            }
+        });
+
+    // Auto-refresh every 3 seconds to ensure sync
+    if (window.messageRefreshInterval) {
+        clearInterval(window.messageRefreshInterval);
+    }
+    
+    window.messageRefreshInterval = setInterval(async () => {
+        if (activeChat && currentUser) {
+            await refreshMessages();
+            await updateFriendsOnlineStatus();
+        }
+    }, 3000);
+}
+
+// Handle new message with better error handling
+async function handleNewMessage(payload) {
+    try {
+        // Get user profile for the new message
+        const { data: userProfile, error } = await supabase
+            .from('user_profiles')
+            .select('full_name, username')
+            .eq('user_id', payload.new.user_id)
+            .single();
+
+        if (error) {
+            console.error('Error fetching user profile:', error);
+            return;
+        }
+
+        const messageWithProfile = {
+            ...payload.new,
+            user_profiles: userProfile
+        };
+
+        // Show notification if message is not from current user
+        if (payload.new.user_id !== currentUser.id) {
+            const senderName = userProfile ? userProfile.full_name : 'Someone';
+            let notificationBody = '';
+
+            if (payload.new.message_type === 'text') {
+                notificationBody = payload.new.content;
+            } else if (payload.new.message_type === 'image') {
+                notificationBody = `${senderName} sent you an image`;
+            } else if (payload.new.message_type === 'video') {
+                notificationBody = `${senderName} sent you a video`;
+            }
+
+            // Play notification sound and show notification
+            playNotificationSound();
+            showLocalNotification(
+                `New message from ${senderName}`,
+                notificationBody,
+                {
+                    type: 'message',
+                    sender_id: payload.new.user_id,
+                    message_id: payload.new.id
+                }
+            );
+        }
+
+        // Display message if it's for the active chat or force refresh
+        if (shouldDisplayMessage(messageWithProfile)) {
+            displayMessage(messageWithProfile);
+            scrollToBottom();
+        } else {
+            // Refresh chat list to show new message indicator
+            await loadFriends();
+        }
+    } catch (error) {
+        console.error('Error handling new message:', error);
+    }
+}
+
+// Refresh messages from database
+async function refreshMessages() {
+    if (!activeChat || activeChatType !== 'user') return;
+
+    try {
+        const { data, error } = await supabase
+            .from('messages')
+            .select(`
+                *,
+                user_profiles(full_name, username)
+            `)
+            .or(`and(user_id.eq.${currentUser.id},recipient_id.eq.${activeChat.user_id}),and(user_id.eq.${activeChat.user_id},recipient_id.eq.${currentUser.id})`)
+            .order('created_at', { ascending: true })
+            .limit(50);
+
+        if (error) throw error;
+
+        // Only update if we have new messages
+        const currentMessageCount = document.querySelectorAll('.message').length;
+        if (data.length !== currentMessageCount) {
+            const messagesContainer = document.getElementById('chat-messages');
+            messagesContainer.innerHTML = '';
+
+            data.forEach(message => {
+                displayMessage(message);
+            });
+
+            scrollToBottom();
+        }
+    } catch (error) {
+        console.error('Error refreshing messages:', error);
+    }
+}
+
+// Update online status for friends
+async function updateFriendsOnlineStatus() {
+    try {
+        const friendElements = document.querySelectorAll('.user-item');
+        friendElements.forEach(async (element) => {
+            const userId = element.dataset.userId;
+            if (userId) {
+                const { data } = await supabase
+                    .from('user_profiles')
+                    .select('is_online, last_seen')
+                    .eq('user_id', userId)
+                    .single();
+
+                if (data) {
+                    updateUserOnlineIndicator(element, data.is_online, data.last_seen);
+                }
+            }
+        });
+    } catch (error) {
+        console.error('Error updating online status:', error);
+    }
+}
+
+// Update online users from presence
+function updateOnlineUsers() {
+    const presenceState = messagesSubscription.presenceState();
+    console.log('Current presence state:', presenceState);
+    
+    // Update UI based on presence
+    Object.keys(presenceState).forEach(userId => {
+        const userElement = document.querySelector(`[data-user-id="${userId}"]`);
+        if (userElement) {
+            updateUserOnlineIndicator(userElement, true, new Date().toISOString());
+        }
+    });
+}
 }
 
 // Check if message should be displayed in current chat
@@ -1249,31 +1511,46 @@ function shouldDisplayMessage(message) {
            (message.user_id === activeChat.user_id && message.recipient_id === currentUser.id);
 }
 
-// Display a message
+// Display a message with duplicate prevention
 function displayMessage(message) {
     const messagesContainer = document.getElementById('chat-messages');
+    
+    // Check if message already exists
+    const existingMessage = document.querySelector(`[data-message-id="${message.id}"]`);
+    if (existingMessage) {
+        console.log('Message already displayed:', message.id);
+        return;
+    }
+
     const messageElement = document.createElement('div');
     messageElement.className = `message ${message.user_id === currentUser.id ? 'own' : 'other'}`;
+    messageElement.dataset.messageId = message.id;
 
     const messageTime = new Date(message.created_at).toLocaleTimeString();
 
     let contentHtml = '';
 
     if (message.message_type === 'text') {
-        contentHtml = `<div class="message-content">${message.content}</div>`;
+        contentHtml = `<div class="message-content">${escapeHtml(message.content)}</div>`;
     } else if (message.message_type === 'image') {
         contentHtml = `
-            <div class="message-content">${message.content || ''}</div>
+            <div class="message-content">${message.content ? escapeHtml(message.content) : ''}</div>
             <img src="${message.media_url}" class="message-media" alt="Image" onclick="openImageModal('${message.media_url}')">
         `;
     } else if (message.message_type === 'video') {
         contentHtml = `
-            <div class="message-content">${message.content || ''}</div>
+            <div class="message-content">${message.content ? escapeHtml(message.content) : ''}</div>
             <video src="${message.media_url}" class="message-media" controls></video>
         `;
     }
 
+    // Add sender name for other users' messages
+    const senderName = message.user_id !== currentUser.id && message.user_profiles 
+        ? `<div class="message-sender">${message.user_profiles.full_name}</div>` 
+        : '';
+
     messageElement.innerHTML = `
+        ${senderName}
         ${contentHtml}
         <div class="message-time">${messageTime}</div>
     `;
@@ -1281,7 +1558,14 @@ function displayMessage(message) {
     messagesContainer.appendChild(messageElement);
 }
 
-// Send message
+// Escape HTML to prevent XSS
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Send message with better confirmation
 async function sendMessage() {
     if (!activeChat || activeChatType !== 'user') return;
 
@@ -1289,6 +1573,9 @@ async function sendMessage() {
     const content = messageInput.value.trim();
 
     if (!content) return;
+
+    // Clear input immediately for better UX
+    messageInput.value = '';
 
     try {
         const messageData = {
@@ -1298,15 +1585,39 @@ async function sendMessage() {
             message_type: 'text'
         };
 
-        const { error } = await supabase
+        const { data, error } = await supabase
             .from('messages')
-            .insert([messageData]);
+            .insert([messageData])
+            .select(`
+                *,
+                user_profiles(full_name, username)
+            `);
 
         if (error) throw error;
 
-        messageInput.value = '';
+        // Display the message immediately with user profile
+        if (data && data[0]) {
+            const messageWithProfile = {
+                ...data[0],
+                user_profiles: currentUserProfile
+            };
+            
+            // Only display if not already displayed by real-time subscription
+            setTimeout(() => {
+                const messageExists = document.querySelector(`[data-message-id="${data[0].id}"]`);
+                if (!messageExists) {
+                    displayMessage(messageWithProfile);
+                    scrollToBottom();
+                }
+            }, 100);
+        }
+
+        console.log('Message sent successfully:', data);
     } catch (error) {
-        showError(error.message);
+        console.error('Error sending message:', error);
+        showError('Failed to send message: ' + error.message);
+        // Restore message content if failed
+        messageInput.value = content;
     }
 }
 
