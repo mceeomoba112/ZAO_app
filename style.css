@@ -17,6 +17,7 @@
     --shadow-glass: 0 8px 32px rgba(31, 38, 135, 0.37);
     --glow-primary: 0 0 40px rgba(102, 126, 234, 0.4);
     --glow-secondary: 0 0 40px rgba(240, 147, 251, 0.4);
+    --bg-dark: #1a1a2e; /* Added for indicator border */
 }
 
 /* Reset and Base Styles */
@@ -459,7 +460,7 @@ body::before {
     flex: 1;
     display: flex;
     flex-direction: column;
-    background: rgba(0, 0, 0, 0.2);
+    background: rgba(0, 0, 0, 0.1);
     min-width: 0;
 }
 
@@ -1558,7 +1559,7 @@ body {
     gap: 8px;
 }
 
-.accept-request-button, 
+.accept-request-button,
 .reject-request-button {
     padding: 8px 12px;
     border: none;
